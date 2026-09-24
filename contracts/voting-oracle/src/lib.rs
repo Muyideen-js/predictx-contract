@@ -23,6 +23,8 @@ enum DataKey {
     PollStatus(u64),
     /// `poll_id` → vote tally. (Temporary — only needed during the voting window)
     VoteTally(u64),
+    /// `poll_id` → automatically resolved outcome.
+    PollOutcome(u64),
     /// `(poll_id, voter)` → `bool` — has this voter cast a vote? (Temporary)
     HasVoted(u64, Address),
 }
@@ -41,6 +43,14 @@ pub(crate) fn read_poll_status(env: &Env, poll_id: u64) -> PollStatus {
         .get(&DataKey::PollStatus(poll_id));
 
     stored.map(|s| s.status).unwrap_or(PollStatus::Active)
+}
+
+pub(crate) fn read_poll_status_updated_at(env: &Env, poll_id: u64) -> u64 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, StoredPollStatus>(&DataKey::PollStatus(poll_id))
+        .map(|stored| stored.updated_at)
+        .unwrap_or(0)
 }
 
 #[contractimpl]
@@ -88,12 +98,7 @@ impl VotingOracle {
     }
 
     pub fn get_poll_status_updated_at(env: Env, poll_id: u64) -> u64 {
-        let stored: Option<StoredPollStatus> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PollStatus(poll_id));
-
-        stored.map(|s| s.updated_at).unwrap_or(0)
+        read_poll_status_updated_at(&env, poll_id)
     }
 
     /// Record a voter's choice on a poll.
@@ -104,6 +109,17 @@ impl VotingOracle {
         choice: VoteChoice,
     ) -> Result<VoteTally, PredictXError> {
         voting::cast_vote(&env, voter, poll_id, choice)
+    }
+
+    pub fn auto_resolve(env: Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
+        voting::auto_resolve(&env, poll_id)
+    }
+
+    pub fn get_poll_outcome(env: Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PollOutcome(poll_id))
+            .ok_or(PredictXError::PollNotFound)
     }
 }
 
