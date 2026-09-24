@@ -1,6 +1,9 @@
 use crate::{storage, DataKey};
-use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally};
-use soroban_sdk::{Address, Env};
+use predictx_shared::{
+    PollStatus, PredictXError, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS, BPS_DENOMINATOR,
+    VOTING_WINDOW_SECS,
+};
+use soroban_sdk::{Address, Env, Symbol};
 
 /// Record a voter's choice on a poll.
 ///
@@ -13,8 +16,7 @@ use soroban_sdk::{Address, Env};
 /// 5. Persists the updated tally and the per-voter dedup marker, and returns
 ///    the tally.
 ///
-/// Out of scope for this change (tracked in separate issues): the voting-window
-/// lifecycle and excluding stakers.
+/// Out of scope for this change (tracked in separate issues): excluding stakers.
 pub fn cast_vote(
     env: &Env,
     voter: Address,
@@ -52,7 +54,9 @@ pub fn cast_vote(
         no_votes: 0,
         unclear_votes: 0,
         total_voters: 0,
-        voting_end_time: 0,
+        voting_end_time: crate::read_poll_status_updated_at(env, poll_id)
+            .checked_add(VOTING_WINDOW_SECS)
+            .unwrap_or(0),
         reward_pool: 0,
     });
 
@@ -68,13 +72,72 @@ pub fn cast_vote(
     Ok(tally)
 }
 
+/// Resolve a voting poll when the winning outcome reaches the automatic
+/// resolution threshold after the voting window closes.
+pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
+    if !env
+        .storage()
+        .persistent()
+        .has(&DataKey::PollStatus(poll_id))
+    {
+        return Err(PredictXError::PollNotFound);
+    }
+
+    if crate::read_poll_status(env, poll_id) != PollStatus::Voting {
+        return Err(PredictXError::VotingNotOpen);
+    }
+
+    let tally = storage::read_tally(env, poll_id).ok_or(PredictXError::PollNotFound)?;
+    if env.ledger().timestamp() < tally.voting_end_time {
+        return Err(PredictXError::VotingNotOpen);
+    }
+
+    let (outcome, winning_votes) =
+        if tally.yes_votes >= tally.no_votes && tally.yes_votes >= tally.unclear_votes {
+            (VoteChoice::Yes, tally.yes_votes)
+        } else if tally.no_votes >= tally.unclear_votes {
+            (VoteChoice::No, tally.no_votes)
+        } else {
+            (VoteChoice::Unclear, tally.unclear_votes)
+        };
+
+    if tally.total_voters == 0 {
+        return Err(PredictXError::ConsensusNotReached);
+    }
+
+    let consensus_bps = (u64::from(winning_votes) * u64::from(BPS_DENOMINATOR)
+        / u64::from(tally.total_voters)) as u32;
+    if consensus_bps < AUTO_RESOLVE_THRESHOLD_BPS {
+        return Err(PredictXError::ConsensusNotReached);
+    }
+
+    let now = env.ledger().timestamp();
+    let stored_status = crate::StoredPollStatus {
+        status: PollStatus::Resolved,
+        updated_at: now,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::PollStatus(poll_id), &stored_status);
+    env.storage()
+        .persistent()
+        .set(&DataKey::PollOutcome(poll_id), &outcome);
+
+    env.events().publish(
+        (Symbol::new(env, "AutoResolved"), poll_id, outcome),
+        consensus_bps,
+    );
+
+    Ok(outcome)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod test {
     extern crate std;
 
-    use predictx_shared::{PollStatus, PredictXError, VoteChoice};
+    use predictx_shared::{PollStatus, PredictXError, VoteChoice, VOTING_WINDOW_SECS};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         Address, Env,
@@ -237,5 +300,66 @@ mod test {
         assert_eq!(tally.poll_id, 2);
         assert_eq!(tally.yes_votes, 1);
         assert_eq!(tally.total_voters, 1);
+    }
+
+    fn cast_votes(env: &Env, client: &VotingOracleClient, yes_votes: u32, no_votes: u32) {
+        for _ in 0..yes_votes {
+            client.cast_vote(&voter(env), &1_u64, &VoteChoice::Yes);
+        }
+        for _ in 0..no_votes {
+            client.cast_vote(&voter(env), &1_u64, &VoteChoice::No);
+        }
+    }
+
+    #[test]
+    fn auto_resolves_at_or_above_threshold_and_emits_event() {
+        use soroban_sdk::{testutils::Events, TryIntoVal};
+
+        let (env, _admin, client) = setup();
+        cast_votes(&env, &client, 24, 1);
+        env.ledger().set_timestamp(1_000_000 + VOTING_WINDOW_SECS);
+
+        let outcome = client.auto_resolve(&1_u64);
+        let events = env.events().all();
+
+        assert_eq!(outcome, VoteChoice::Yes);
+        assert_eq!(client.get_poll_status(&1_u64), PollStatus::Resolved);
+        assert_eq!(client.get_poll_outcome(&1_u64), VoteChoice::Yes);
+
+        assert_eq!(events.len(), 1);
+        let (_, topics, data) = events.get(0).unwrap();
+        let name: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let event_outcome: VoteChoice = topics.get(2).unwrap().try_into_val(&env).unwrap();
+        let consensus_bps: u32 = data.try_into_val(&env).unwrap();
+        assert_eq!(name, soroban_sdk::Symbol::new(&env, "AutoResolved"));
+        assert_eq!(event_outcome, VoteChoice::Yes);
+        assert_eq!(consensus_bps, 9_600);
+    }
+
+    #[test]
+    fn auto_resolve_rejects_consensus_below_threshold() {
+        let (env, _admin, client) = setup();
+        cast_votes(&env, &client, 849, 151);
+        env.ledger().set_timestamp(1_000_000 + VOTING_WINDOW_SECS);
+
+        let err = client
+            .try_auto_resolve(&1_u64)
+            .expect_err("84.9% consensus must not auto-resolve");
+
+        assert_eq!(err, Ok(PredictXError::ConsensusNotReached));
+        assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
+    }
+
+    #[test]
+    fn auto_resolve_rejects_open_voting_window() {
+        let (env, _admin, client) = setup();
+        cast_votes(&env, &client, 24, 1);
+
+        let err = client
+            .try_auto_resolve(&1_u64)
+            .expect_err("resolution must wait for the voting window to close");
+
+        assert_eq!(err, Ok(PredictXError::VotingNotOpen));
+        assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
     }
 }
